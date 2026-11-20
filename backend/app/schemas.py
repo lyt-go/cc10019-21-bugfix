@@ -422,7 +422,11 @@ class FunnelResult(BaseModel):
 
 
 class RetentionResult(BaseModel):
-    """留存计算结果产物。"""
+    """留存计算结果产物。
+
+    observed_dates / valid_samples / completion_version 是 LTV 价值校准的观察来源：
+    只有真正观察到的日期和有效样本才允许参与校准，空的曲线不能被当成零回访。
+    """
 
     config_id: str
     init_event: str
@@ -431,6 +435,19 @@ class RetentionResult(BaseModel):
     cohort_sizes: dict[str, int] = Field(default_factory=dict)
     retention_rates: dict[str, list[float]] = Field(default_factory=dict)
     result_table: str = ""
+    # 已观察到的日期（按天/周期对齐 base_date）
+    observed_dates: list[str] = Field(default_factory=list)
+    # 主队列有效样本数（入组且可被观察到）
+    valid_samples: int = 0
+    # 各队列（含分段）的有效样本数
+    sample_sizes: dict[str, int] = Field(default_factory=dict)
+    # 本次留存计算的完成版本，如 RC-001-v1
+    completion_version: str = ""
+    # observed / no_observation / confirmed_zero_revisit / correcting_enrollment
+    data_status: str = "observed"
+    observation_note: str = ""
+    # 是否已人工确认该留存曲线为零回访（零回访也可作为有效观察参与校准）
+    confirmed_zero_revisit: bool = False
 
 
 class LtvResult(BaseModel):
@@ -442,6 +459,65 @@ class LtvResult(BaseModel):
     predicted_values: list[dict[str, Any]] = Field(default_factory=list)
     avg_ltv: float = 0.0
     calibration_error: float = 0.0
+
+
+class ValueCalibrationResult(BaseModel):
+    """价值校准数据：留存观察来源 + 原始预测 + 校准系数。"""
+
+    calibration_id: str
+    report_version: int = 1
+    model_id: str
+    retention_config_id: str
+    status: str = "calibration_failed"  # calibrated / calibration_failed
+    reason: str = ""
+    valuation_type: str = "original_prediction"
+    observation_source: dict[str, Any] = Field(default_factory=dict)
+    observed_retention_curve: list[dict[str, Any]] = Field(default_factory=list)
+    original_curve: list[dict[str, Any]] = Field(default_factory=list)
+    avg_retention_rate: float | None = None
+    # 只看回访日的均值，便于核对入组日基线是否影响结果
+    avg_revisit_rate: float | None = None
+    calibration_coefficient: float | None = None
+    original_estimate: dict[str, Any] = Field(default_factory=dict)
+    calibrated_avg_ltv: float | None = None
+    confirmed_zero_revisit: bool = False
+    confirmed: bool = False
+    created_at: str = ""
+    # 观察来源的扁平副本，方便列表/导出直接核对
+    observed_dates: list[str] = Field(default_factory=list)
+    valid_samples: int = 0
+    completion_version: str = ""
+    data_status: str = "observed"
+    # 常用别名：coefficient / original_avg_ltv
+    coefficient: float | None = None
+    original_avg_ltv: float = 0.0
+
+
+class FollowupFilterResult(BaseModel):
+    """跟进筛选记录：说明客户是否可安排跟进以及采用的估值类型。"""
+
+    filter_id: str
+    report_version: int = 1
+    model_id: str
+    threshold: float = 0.0
+    case: str = "retention_calibrated"
+    valuation_type: str = "original_prediction"
+    calibration_id: str = ""
+    observation_source: dict[str, Any] = Field(default_factory=dict)
+    original_estimate: dict[str, Any] = Field(default_factory=dict)
+    original_curve: list[dict[str, Any]] = Field(default_factory=list)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    ready_count: int = 0
+    blocked_count: int = 0
+    created_at: str = ""
+    # 观察来源/原始估值的扁平副本，回看旧报告时直接可读
+    observed_dates: list[str] = Field(default_factory=list)
+    valid_samples: int = 0
+    completion_version: str = ""
+    original_avg_ltv: float = 0.0
+    coefficient: float | None = None
+    ready_customers: list[str] = Field(default_factory=list)
+    blocked_customers: list[str] = Field(default_factory=list)
 
 
 class SessionResult(BaseModel):

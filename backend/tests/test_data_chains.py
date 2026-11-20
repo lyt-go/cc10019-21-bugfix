@@ -24,6 +24,15 @@ from app.services.session_split import split_sessions, get_session_result
 from app.services.behavior_path import build_path_sankey, get_path_result
 from app.services.retention_calc import calculate_retention, get_retention_result
 from app.services.lifetime_value import predict_ltv, get_ltv_result, ltv_with_retention
+from app.services.retention_calc import set_observation, confirm_zero_revisit
+from app.services.value_calibration import (
+    calibrate_value,
+    create_followup_filter,
+    followup_customers,
+    get_calibration,
+    get_followup_filter,
+    list_calibrations,
+)
 from app.services.tag_snapshot import create_snapshot, get_snapshot
 from app.services.behavior_heatmap import generate_heatmap, get_heatmap
 from app.services.profile_card import build_profile_card, get_profile_result
@@ -159,6 +168,150 @@ class TestDataChains(unittest.TestCase):
         # 4. 验证产物
         self.assertIsNotNone(get_retention_result("RC-001"))
         self.assertIsNotNone(get_ltv_result("LTV-001"))
+
+    # ========== 链路5b: 留存观察去驱动价值校准与跟进筛选 ==========
+    def test_calibration_uses_observed_curve_only(self) -> None:
+        """校准系数来自已观察回访日；入组日 1.0 不参与均值。"""
+        retention = calculate_retention("RC-001")
+        self.assertEqual(len(retention.observed_dates), 7)
+        self.assertEqual(len(retention.retention_rates["2026-11-01"]), 7)
+
+        calibration = calibrate_value("LTV-001", "RC-001")
+        self.assertEqual(calibration["status"], "calibrated")
+        # 均值与留存计算详情逐点对齐（含入组日基线），不跳点、不补零
+        curve_rates = [point["retention_rate"] for point in calibration["observed_retention_curve"]]
+        expected = sum(curve_rates) / len(curve_rates)
+        self.assertEqual(len(curve_rates), len(retention.retention_rates["2026-11-01"]))
+        self.assertAlmostEqual(calibration["avg_retention_rate"], expected, places=6)
+        self.assertAlmostEqual(
+            calibration["calibration_coefficient"], 0.5 + 0.5 * expected, places=6
+        )
+        # 校准后均值 = 原始预测 × 系数，原始预测本身不改
+        self.assertAlmostEqual(
+            calibration["calibrated_avg_ltv"],
+            round(calibration["original_avg_ltv"] * calibration["calibration_coefficient"], 2),
+            places=2,
+        )
+        # 校准数据必须带上观察来源三件套
+        source = calibration["observation_source"]
+        self.assertEqual(source["observed_dates"], retention.observed_dates)
+        self.assertEqual(source["valid_samples"], retention.valid_samples)
+        self.assertEqual(source["completion_version"], retention.completion_version)
+        self.assertTrue(calibration["original_curve"])
+        self.assertGreater(calibration["original_estimate"]["avg_ltv"], 0)
+
+    def test_confirmed_zero_revisit_still_calibrates(self) -> None:
+        """确认零回访是有效观察：参与校准并得到 0.5 系数，而不是丢失观察。"""
+        confirm_zero_revisit("RC-003")
+        retention = get_retention_result("RC-003")
+        self.assertTrue(retention["confirmed_zero_revisit"])
+        self.assertIn(0.0, retention["retention_rates"]["2026-11-01"][1:])
+
+        calibration = calibrate_value("LTV-001", "RC-003")
+        self.assertEqual(calibration["status"], "calibrated")
+        self.assertTrue(calibration["confirmed_zero_revisit"])
+        self.assertEqual(calibration["avg_revisit_rate"], 0.0)
+        # 1.0 的入组日基线 + 观察到的零回访 → 均值是 1/7，不是缺失曲线时的 0
+        self.assertAlmostEqual(calibration["avg_retention_rate"], 1 / 7, places=6)
+        self.assertAlmostEqual(
+            calibration["calibration_coefficient"], 0.5 + 0.5 / 7, places=6
+        )
+
+        followup = create_followup_filter("LTV-001", 1, case="confirmed_zero_revisit")
+        self.assertEqual(followup["case"], "confirmed_zero_revisit")
+        self.assertEqual(followup["valuation_type"], "retention_calibrated")
+        self.assertEqual(followup["calibration_id"], calibration["calibration_id"])
+        self.assertTrue(all(item["valuation_type"] == "retention_calibrated" for item in followup["items"]))
+
+    def test_correcting_enrollment_fails_without_coefficient(self) -> None:
+        """指定留存组在更正入组数据：不生成系数并说明原因，保留原始预测。"""
+        result = calculate_retention("RC-002")
+        self.assertEqual(result.data_status, "correcting_enrollment")
+        self.assertEqual(result.observed_dates, [])
+
+        calibration = calibrate_value("LTV-002", "RC-002")
+        self.assertEqual(calibration["status"], "calibration_failed")
+        self.assertIsNone(calibration["calibration_coefficient"])
+        self.assertIsNone(calibration["calibrated_avg_ltv"])
+        self.assertIn("更正入组数据", calibration["reason"])
+        self.assertEqual(calibration["valuation_type"], "original_prediction")
+        self.assertGreater(calibration["original_estimate"]["avg_ltv"], 0)
+        self.assertTrue(calibration["original_curve"])
+
+        followup = create_followup_filter("LTV-002", 3.5)
+        self.assertEqual(followup["case"], "calibration_failed")
+        self.assertEqual(followup["valuation_type"], "original_prediction")
+        self.assertEqual(followup["ready_count"] + followup["blocked_count"], len(followup["items"]))
+        self.assertGreater(followup["ready_count"], 0)
+        self.assertTrue(all(item["valuation_type"] == "original_prediction" for item in followup["items"]))
+        self.assertIn("更正入组数据", followup["items"][0]["reason"])
+        # 沿用原始预测，不因校准失败被减半
+        first = followup["items"][0]
+        self.assertEqual(first["valuation"], first["predicted_value"])
+
+        customers = followup_customers("LTV-002", 3.5, case="calibration_failed")
+        self.assertEqual(customers["valuation_type"], "original_prediction")
+        self.assertEqual(len(customers["items"]), followup["ready_count"])
+
+    def test_no_sample_reports_reason(self) -> None:
+        """样本缺失时不能生成系数，原因要能读懂。"""
+        set_observation("RC-002", observation_state="observed", observed_days=5, sample_size=0)
+        result = calculate_retention("RC-002")
+        self.assertEqual(result.data_status, "no_sample")
+        self.assertEqual(result.valid_samples, 0)
+        self.assertEqual(result.observed_dates, [])
+
+        calibration = calibrate_value("LTV-002", "RC-002")
+        self.assertEqual(calibration["status"], "calibration_failed")
+        self.assertIsNone(calibration["calibration_coefficient"])
+        self.assertIn("有效样本", calibration["reason"])
+
+    def test_recompute_keeps_old_reports_and_curves(self) -> None:
+        """留存补算后重试同一门槛：新报告更新，旧报告仍能核对原值和曲线。"""
+        calculate_retention("RC-001")
+        first_calibration = calibrate_value("LTV-001", "RC-001")
+        first_followup = create_followup_filter("LTV-001", 100)
+        first_avg = first_calibration["original_estimate"]["avg_ltv"]
+        first_curve_len = len(first_calibration["original_curve"])
+
+        # 补算留存 → 新的完成版本
+        recomputed = calculate_retention("RC-001")
+        self.assertNotEqual(
+            recomputed.completion_version,
+            first_calibration["observation_source"]["completion_version"],
+        )
+        second_calibration = calibrate_value("LTV-001", "RC-001")
+        self.assertNotEqual(
+            second_calibration["calibration_id"], first_calibration["calibration_id"]
+        )
+        self.assertGreater(
+            second_calibration["report_version"], first_calibration["report_version"]
+        )
+
+        # 同一门槛重试得到新记录，旧记录保持原样
+        second_followup = create_followup_filter("LTV-001", 100)
+        self.assertGreater(second_followup["report_version"], first_followup["report_version"])
+        self.assertEqual(
+            second_followup["calibration_id"], second_calibration["calibration_id"]
+        )
+
+        old_calibration = get_calibration(first_calibration["calibration_id"])
+        self.assertEqual(old_calibration["original_estimate"]["avg_ltv"], first_avg)
+        self.assertEqual(len(old_calibration["original_curve"]), first_curve_len)
+        self.assertEqual(
+            old_calibration["observation_source"]["completion_version"],
+            first_calibration["observation_source"]["completion_version"],
+        )
+        old_followup = get_followup_filter(first_followup["filter_id"])
+        self.assertEqual(old_followup["calibration_id"], first_calibration["calibration_id"])
+        self.assertEqual(old_followup["original_estimate"]["avg_ltv"], first_avg)
+        self.assertEqual(len(old_followup["original_curve"]), first_curve_len)
+
+        failed_versions = [
+            row["report_version"]
+            for row in list_calibrations(model_id="LTV-001")
+        ]
+        self.assertEqual(len(failed_versions), len(set(failed_versions)))
 
     # ========== 链路6: 标签快照消费标签计算+分群结果 ==========
     def test_chain_tag_snapshot_consumes_compute_and_segment(self) -> None:

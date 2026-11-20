@@ -26,8 +26,11 @@ class Store:
             for name in self._tables
         }
 
+    # 内部产物表：不参与“业务模块”看板（价值校准/跟进筛选是跨模块产物）
+    INTERNAL_MODULES = {"value_calibration", "followup_filter"}
+
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in self.INTERNAL_MODULES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
@@ -100,6 +103,14 @@ class Store:
     def get_artifact(self, artifact_type: str, artifact_id: str) -> dict[str, Any] | None:
         """获取跨模块数据产物。"""
         return self._artifacts.get(artifact_type, {}).get(artifact_id)
+
+    def clear_artifact(self, artifact_type: str, artifact_id: str) -> bool:
+        """清除单个数据产物（例如观察口径变化后让下次读取重新计算）。"""
+        bucket = self._artifacts.get(artifact_type)
+        if not bucket or artifact_id not in bucket:
+            return False
+        del bucket[artifact_id]
+        return True
 
     def list_artifacts(self, artifact_type: str) -> list[dict[str, Any]]:
         """列出某类型的所有产物。"""

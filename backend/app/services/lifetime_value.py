@@ -91,27 +91,34 @@ def get_ltv_result(model_id: str) -> dict[str, Any] | None:
 
 
 def ltv_with_retention(model_id: str, retention_config_id: str) -> dict[str, Any]:
-    """结合留存率校准LTV预测。"""
-    ltv_result = get_ltv_result(model_id)
-    retention_result = get_retention_result(retention_config_id)
+    """结合留存率校准LTV预测。
 
-    if ltv_result is None or retention_result is None:
-        raise ValueError("Result not found")
+    委托价值校准服务：只使用留存计算已观察到的日期点；没有观察点或样本时
+    不生成系数，原样返回原始预测并在 reason 里说明原因。
+    """
+    from app.services.value_calibration import calibrate_value
 
-    # 使用留存率调整预测
-    retention_rates = retention_result.get("retention_rates", {})
-    avg_retention = 0.0
-    if retention_rates:
-        first_key = list(retention_rates.keys())[0]
-        rates = retention_rates[first_key]
-        avg_retention = sum(rates) / len(rates) if rates else 0.0
-
-    adjusted_ltv = ltv_result["avg_ltv"] * (0.5 + 0.5 * avg_retention)
-
+    calibration = calibrate_value(model_id, retention_config_id)
+    observation = calibration.get("observation_source", {})
+    calibrated = calibration.get("status") == "calibrated"
     return {
         "model_id": model_id,
         "retention_config_id": retention_config_id,
-        "original_ltv": ltv_result["avg_ltv"],
-        "retention_adjusted_ltv": round(adjusted_ltv, 2),
-        "avg_retention_rate": round(avg_retention, 4),
+        "calibration_id": calibration.get("calibration_id", ""),
+        "status": calibration.get("status"),
+        "reason": calibration.get("reason", ""),
+        "original_ltv": calibration.get("original_estimate", {}).get("avg_ltv", 0.0),
+        "retention_adjusted_ltv": (
+            calibration.get("calibrated_avg_ltv")
+            if calibrated
+            else calibration.get("original_estimate", {}).get("avg_ltv", 0.0)
+        ),
+        "calibration_coefficient": calibration.get("calibration_coefficient"),
+        "avg_retention_rate": calibration.get("avg_retention_rate"),
+        "valuation_type": calibration.get("valuation_type"),
+        "observed_dates": observation.get("observed_dates", []),
+        "valid_samples": observation.get("valid_samples", 0),
+        "completion_version": observation.get("completion_version", ""),
+        "confirmed_zero_revisit": calibration.get("confirmed_zero_revisit", False),
+        "original_curve": calibration.get("original_curve", []),
     }

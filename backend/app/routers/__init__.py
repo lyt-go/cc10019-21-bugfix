@@ -20,6 +20,7 @@ from app.routers import (
     tag_drill,
     tag_snapshot,
     user_segment,
+    value_calibration,
 )
 
 ROUTERS = [
@@ -41,4 +42,5 @@ ROUTERS = [
     tag_drill,
     tag_snapshot,
     user_segment,
+    value_calibration,
 ]
